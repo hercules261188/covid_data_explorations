@@ -2,13 +2,15 @@ import glob
 import json
 import requests
 from io import BytesIO, StringIO
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.dates import DateFormatter
 from matplotlib.ticker import StrMethodFormatter, MultipleLocator
-from sklearn.linear_model import LinearRegression
-from scipy.stats import boxcox
+from sklearn.preprocessing import PowerTransformer
+from sklearn.compose import TransformedTargetRegressor
+from sklearn.linear_model import Ridge
 from IPython.display import display
 
 
@@ -32,9 +34,7 @@ DAYS_PER_MONTH = [np.array([31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]),
                   ]
 
 ### Functions for getting deaths and population by age
-
 def get_sweden_deaths():
-    # url for deaths during the year - https://www.statistikdatabasen.scb.se/pxweb/en/ssd/START__BE__BE0101__BE0101I/DodaFodelsearK/
     ages = "0-64", "65-79", "80-89", "90+"
     df = (
         pd.read_excel("data/Sweden/deaths_current.xlsx", sheet_name=2, header=[5, 6, 7])
@@ -104,6 +104,7 @@ def get_sweden_deaths():
     # daily deaths are "age during the year" different deaths than
     return df_all
 
+
 def get_sweeden_historical_data():
     def get_data(kind, years):
         years = list(years)
@@ -142,18 +143,27 @@ def get_sweeden_historical_data():
         df.columns = range(101)
         return df
 
-    df_pop_age_start = get_data('start', ['2021M01'])
-    df_pop_age_end = get_data('end', range(1990, 2021))
-    df_deaths = get_data('deaths', range(1990, 2021))
+    df_deaths1 = pd.read_csv('data/Sweden/deaths.csv', index_col='year') # smaller
+    # df_deaths2 = pd.read_csv('data/Sweden/deaths_year_of_birth.csv', index_col='year') # larger
+    df_age = pd.read_csv('data/Sweden/age.csv', index_col='year')
+    df_deaths = df_deaths1
 
-    df_pop_age = df_pop_age_end + df_deaths
-    df_pop_age_final = pd.concat([df_pop_age, df_pop_age_start])
-    df_pop_age_final[0] //= 2
-    df_pop_age_final.loc[2021, 0] = df_pop_age_final.loc[2020, 0]
-    return df_deaths, df_pop_age_final
+    df_age = df_age + df_deaths
+    df_age_start = get_data('start', ['2021M01'])
+    df_age.loc[2021] = df_age_start.loc[2021].values
+    df_age.iloc[-1, 0] = df_age.iloc[-2, 0]
+    
+    # df_age_start = get_data('start', ['2021M01'])
+    # df_age.loc[2021] = df_age_start.loc[2021].values - df_deaths.iloc[-1].values
+
+    df_age.columns = df_age.columns.astype('int64')
+    df_deaths.columns = df_deaths.columns.astype('int64')
+    return df_deaths, df_age
 
 
 def get_nz_deaths():
+    # from http://infoshare.stats.govt.nz/
+    # use "as at" for quarter ending in March
     file = sorted(glob.glob("data/New Zealand/2021*"))[-1]
     cols = ["indicator_name", "category", "sub_series_name", "parameter", "value"]
     ages = ["Under 30", "30 to 59", "60 to 79", "80 and over", "Total"]
@@ -181,6 +191,7 @@ def get_norway_deaths():
     headers = {"Content-type": "application/json", "Accept": "*/*"}
     r = requests.post("https://data.ssb.no/api/v0/en/table/07995", json=q)
     data = r.json()
+
     dfs = []
     for i in range(106):
         df = pd.DataFrame(
@@ -198,6 +209,14 @@ def get_norway_deaths():
     df = df.loc[:, :100]
     df.index = pd.date_range(start="2014-1-5", periods=len(df), freq="W")
     df = df.reindex(pd.date_range(start="2014-1-1", end=df.index[-1]), method="bfill") / 7
+    bins = [0, 5, 20, 35, 50, 65, 80, 90, 130]
+    g = pd.cut(df.columns, bins, right=False, precision=0)
+    df = df.groupby(g, axis=1).sum()
+    names = []
+    for col in df.columns:
+        names.append(f'{col.left}-{col.right - 1}')
+    names[-1] = '90+'
+    df.columns = names
     return df
 
 
@@ -209,9 +228,7 @@ def get_denmark_deaths():
     with open("data/Denmark/deaths_weekly.csv", "w") as f:
         f.write(s)
 
-    df = pd.read_csv(
-        "data/Denmark/deaths_weekly.csv", names=["date", "age", "deaths"], skiprows=1
-    )
+    df = pd.read_csv("data/Denmark/deaths_weekly.csv", names=["date", "age", "deaths"], skiprows=1)
     df = df.query('age != "Total"').copy()
     df["date"] = pd.to_datetime(df["date"] + "D0", format="%YU%UD%w")
     df["age"] = df["age"].str.split().str[0]
@@ -220,13 +237,23 @@ def get_denmark_deaths():
     df.iloc[n:, 0] += pd.Timedelta("7D")
     df = df.pivot(index="date", columns="age", values="deaths")[ages]
     df = df.reindex(pd.date_range("2021-01-01", df.index[-1]), method="bfill") / 7
-    df1 = pd.read_csv(
-        "data/Denmark/daily07-20.csv", parse_dates=["date"], index_col="date"
-    )
+    df1 = pd.read_csv("data/Denmark/daily07-20.csv", parse_dates=["date"], index_col="date" )
     df = pd.concat([df1, df])
-    df["95-99"] += df["100"]
-    df = df.loc[:, :"95-99"].rename(columns={"95-99": "95+"})
-    return df
+    df["90-94"] += df["95-99"] + df["100"]
+    df = df.loc[:, :"90-94"].rename(columns={"90-94": "90+"})
+
+    df_final = df[['0-4']].copy()
+    left = ['5-9', '20-24', '35-39', '50-54', '65-69', '80-84']
+    right = ['15-19', '30-34', '45-49', '60-64', '75-79', '85-89']
+    last = df.columns[-1]
+    for col_left, col_right in zip(left, right):
+        new_left = col_left.split('-')[0]
+        new_right = col_right.split('-')[1]
+        new_col = f'{new_left}-{new_right}'
+        df_final[new_col] = df.loc[:, col_left:col_right].sum(axis=1)
+
+    df_final[last] = df[last]
+    return df_final
 
 
 def get_finland_deaths():
@@ -245,7 +272,21 @@ def get_finland_deaths():
     df = df.rename(columns={"90 -": "90+"})
     df.index = pd.date_range("2015-1-4", periods=len(df), freq="W")
     df = df.reindex(pd.date_range("2015-1-1", df.index[-1]), method="bfill") / 7
-    return df
+    df.columns = df.columns.str.replace(' ', '')
+
+
+    df_final = df[['0-4']].copy()
+    left = ['5-9', '20-24', '35-39', '50-54', '65-69', '80-84']
+    right = ['15-19', '30-34', '45-49', '60-64', '75-79', '85-89']
+    last = df.columns[-1]
+    for col_left, col_right in zip(left, right):
+        new_left = col_left.split('-')[0]
+        new_right = col_right.split('-')[1]
+        new_col = f'{new_left}-{new_right}'
+        df_final[new_col] = df.loc[:, col_left:col_right].sum(axis=1)
+
+    df_final[last] = df[last]
+    return df_final
 
 
 def get_uk_deaths():
@@ -278,28 +319,32 @@ country_dict = {
 }
 
 
-def predict_deaths(s, m=1, n=0):
-    """
-    Build linear model on a particular age group
-    Box-Cox to transform first before linear regression
-    """
-    values = s.values
-    if m == 0:
-        y = values
-    else:
-        y = values[:-m]
-    y_max = y.max()
-    y = y / y_max
-    y, t = boxcox(y)
-    x = np.arange(len(y) + m + n)
-    X = x.reshape(-1, 1)
-    reg = LinearRegression()
-    reg.fit(X[: -m - n], y)
-    y_pred = reg.predict(X)
-    y_pred = (y_pred * t + 1) ** (1 / t) * y_max
-    index = np.arange(s.index[0], s.index[0] + len(y_pred))
-    return pd.Series(y_pred, index=index)
+def predict_deaths(s, last_training_year):
+    s_train = s.loc[:last_training_year]
 
+    n = len(s) + 1 # predict one year into the future
+    y = s_train.values
+    x = np.arange(n)
+    X = x.reshape(-1, 1)
+    X2 = np.column_stack((x, x ** 2))
+
+    n_train = len(s_train)
+    X_train = X[:n_train]
+    X2_train = X2[:n_train]
+
+    # train model using ridge regression on box-cox transformed values
+    ttr = TransformedTargetRegressor(regressor=Ridge(alpha=1), transformer=PowerTransformer('box-cox'))
+    ttr.fit(X_train, y)
+    yp1 = ttr.predict(X)
+    ttr.fit(X2_train, y)
+    yp2 = ttr.predict(X2)
+
+    # average predictions
+    yp = yp1 * 3/3 + yp2 * 0/3
+
+    index = range(s.index[0], s.index[-1] + 2)
+    sp = pd.Series(yp, index=index)
+    return sp
 
 def convert_age_to_slice(age):
     if age.endswith("+"):
@@ -324,13 +369,18 @@ def add_line_name(names, ax):
         ax.text(x, val, name, color=line.get_color(), size=8, va="center")
 
 
-def plot_excess_bars(title, countries):
+def plot_excess_bars(title, countries, year='2019', age='total'):
     """
     Bar plot of each countries excess deaths for each year in 2019-2021
     """
-    names = tuple(c.country for c in countries)
-    df = pd.concat([c.excess for c in countries], axis=1, keys=names).tail(3)
-    df.loc["2019-21 Total"] = df.sum()
+    names = []
+    vals = []
+    for c in countries:
+        vals.append(c.excess_deaths_daily.loc[year:, age].resample('Y', kind='period').sum())
+        names.append(c.country)
+
+    df = pd.concat(vals, axis=1, keys=names).tail(3)
+    df.loc["{year}-21 Total"] = df.sum()
     ax = df.plot(kind="bar", rot=0)
     ax.set_title(title, size=10)
 
@@ -408,7 +458,7 @@ def plot_grid_expected(start, end, countries, age=0):
     fig.savefig("images/nordic_grid.png", facecolor="white", bbox_inches="tight")
 
 
-def plot_excess_baseline_other(countries, baseline):
+def plot_excess_baseline_other(countries, baseline, ax=None, **kwargs):
     names = []
     dfs = []
     labels = []
@@ -422,7 +472,11 @@ def plot_excess_baseline_other(countries, baseline):
         labels.append(f"{baseline_name} with {c.country}'s population")
     df = pd.concat(dfs, axis=1, keys=names)
 
-    fig, ax = plt.subplots(figsize=(7, 3))
+    if ax is None:
+        if not kwargs:
+            kwargs['figsize'] = (7, 3)
+        fig, ax = plt.subplots(**kwargs)
+
     df.plot(kind="bar", rot=0, ax=ax)
     ax.legend(labels=labels)
     ax.set_ylabel("Excess Deaths")
@@ -446,28 +500,23 @@ def plot_perc_over_age(age, year, countries):
     return s
 
 
-def plot_perc_mort_dec(countries, age=70):
-    dfs = []
+def plot_perc_mort_change(countries, age=70, year=2019, **kwargs):
+    changes = []
     names = []
     for c in countries:
-        df = c.rate_grouped.copy()
-        s = df.loc[:, 95:].sum(axis=1)
-        df = df.loc[:, age:90]
-        interval = pd.Interval(95, 105, closed="left")
-        df.columns = df.columns.remove_unused_categories().add_categories(interval)
-        df[interval] = s
-        dec = df.pct_change().iloc[-2]
-        dfs.append(dec)
+        change = c.rate_grouped.loc[year, age:] / c.rate_pred.loc[year, age:] - 1
+        changes.append(change)
         names.append(c.country)
-
-    df = pd.concat(dfs, axis=1, keys=names) * 100
+        
+    df = pd.concat(changes, axis=1, keys=names) * 100
     idx = [f"{i.left}-{i.right - 1}" for i in df.index[:-1]]
     idx.append(f"{df.index[-1].left}+")
     df.index = idx
     df.index.name = "age"
-    ax = df.plot(kind="bar", rot=0)
-    ax.set_title("Percent change in mortality rate from 2018 to 2019", size=10)
-    ax.set_ylabel("% decrease")
+    fig, ax = plt.subplots(**kwargs)
+    df.plot(kind="bar", rot=0, ax=ax)
+    ax.set_title(f"Percentage Deviation from Mortality Rate Trend Line from {year - 1} to {year}", size=10)
+    ax.set_ylabel("% change")
     ax.legend(bbox_to_anchor=(1, 1))
 
 
@@ -501,21 +550,24 @@ class Excess:
             deaths = deaths.loc[self.start_year :]
             deaths.columns = deaths.columns.astype("int")
 
+            last = age.loc[2021]
+            age += deaths
+            age.loc[2021] = last + deaths.loc[2020]
+            
+
         self.age = age.loc[self.start_year:]
         self.deaths = deaths.loc[self.start_year:]
 
     def get_age_deaths_rate(self):
-        other_ages = list(range(50, self.max_age, 5))
-        bins = [0, 5, 10, 15, 30, 40] + other_ages
+        other_ages = list(range(45, 100, 5)) + [130]
+        bins = [0, 5, 10, 15, 25, 30, 35, 40] + other_ages
         self.age_grouper = pd.cut(self.age.columns, bins, right=False, precision=0)
 
         deaths_grouped = self.deaths.groupby(self.age_grouper, axis=1).sum()
         age_grouped = self.age.groupby(self.age_grouper, axis=1).sum()
         rate_grouped = (deaths_grouped / age_grouped).dropna()
-        last_known_year = rate_grouped.index[-1]
 
-        m = 2020 - self.last_training_year
-        rate_pred = rate_grouped.apply(predict_deaths, m=m, n=1)
+        rate_pred = rate_grouped.apply(predict_deaths, last_training_year=self.last_training_year)
         expected_deaths = rate_pred * age_grouped
 
         self.deaths_grouped = deaths_grouped
@@ -530,11 +582,6 @@ class Excess:
         self.daily_deaths = self.get_country_func()
         if self.skip > 0:
             self.daily_deaths = self.daily_deaths.iloc[: -self.skip]
-        if self.group_daily:
-            self.daily_deaths = self.daily_deaths.groupby(self.age_grouper, axis=1).sum()
-            cols = [f"{col.left}-{col.right - 1}" for col in self.daily_deaths.columns]
-            cols[-1] = cols[-1].split("-")[0] + "+"
-            self.daily_deaths.columns = cols
 
         self.daily_deaths["total"] = self.daily_deaths.sum(axis=1)
         return (
@@ -552,7 +599,10 @@ class Excess:
         return month_mult
 
     def compute_expected(self, age_group, year):
-        age_slice = convert_age_to_slice(age_group)
+        if not isinstance(age_group, slice):
+            age_slice = convert_age_to_slice(age_group)
+        else:
+            age_slice = age_group
         deaths = self.expected_deaths.loc[year, age_slice].sum()
         is_leap_year = year % 4 == 0
         days = DAYS_PER_MONTH[is_leap_year].sum()
@@ -560,7 +610,8 @@ class Excess:
 
     def get_expected_month(self):
         dfs = []
-        years = range(self.last_training_year + 1, 2022)
+        first_daily_year = self.daily_deaths.index[0].year
+        years = range(first_daily_year, 2022)
         for year in years:
             df = pd.DataFrame()
             for age_group in self.daily_deaths.columns:
@@ -575,40 +626,51 @@ class Excess:
         self.actual_deaths_per_month = self.daily_deaths.resample('M', kind='period').mean()
         self.excess_deaths_per_month = (self.actual_deaths_per_month - self.expected_deaths_per_month).dropna()
 
-        idx = pd.date_range(f'{self.first_pred_year}', self.last_daily_date)
+        idx = pd.date_range(f'{first_daily_year}', self.last_daily_date)
         self.expected_deaths_daily = expected_deaths_per_month.to_timestamp().reindex(idx, method='ffill')
-        self.actual_deaths_daily = self.actual_deaths_per_month.to_timestamp().reindex(idx, method='ffill')
-        self.excess_deaths_daily = self.excess_deaths_per_month.to_timestamp().reindex(idx, method='ffill')
+        self.excess_deaths_daily = self.daily_deaths - self.expected_deaths_daily
         self.excess.iloc[-1] = self.excess_deaths_daily.loc['2021', 'total'].sum()
 
-    def plot_month_exp_vs_actual(self, age, year, how="daily", kind="line", **kwargs):
+    def plot_month_exp_vs_actual(self, age, year, how="daily", kind="line", ax=None, **kwargs):
         year = str(year)
-        fig, ax = plt.subplots(**kwargs)
-        self.actual_deaths_per_month.loc[year:, age].to_timestamp().plot(marker='.', label='actual', ax=ax)
-        self.expected_deaths_per_month.loc[year:, age].to_timestamp().plot(marker='.', label='expected', ax=ax)
+        if ax is None:
+            fig, ax = plt.subplots(**kwargs)
+        actual = self.actual_deaths_per_month.loc[year:, age].to_timestamp()
+        expected = self.expected_deaths_per_month.loc[year:, age].to_timestamp()
+        actual  = actual.asfreq('D').interpolate()
+        expected  = expected.asfreq('D').interpolate()
+        expected.plot(label='expected', ax=ax, color='black', ls='-', lw=2)
+        actual.plot(label='actual', ax=ax, color='black', lw=2, ls='--')
+        
+        n = len(actual)
+        ax.fill_between(actual.index, actual.values, expected[:n], 
+                        actual.values > expected.values[:n], color='red', label='Excess')
+        ax.fill_between(actual.index, actual.values, expected[:n], 
+                        actual.values < expected.values[:n], color='green', label='Deficit')
         ax.legend()
         if age == "total":
             age = ' '
         else:
             age = ' ' + age + ' '
-        ax.set_title(f'{self.country}{age}Actual vs Expected Daily Deaths by Month', size=10)
+        ax.set_title(f'{self.country}{age}Actual vs Expected Daily Deaths by Month', size=12)
 
-    def plot_trend_line(self, year, age=None, ax=None, legend=True, auto_label=True, return_data=False, **kwargs):
+    def plot_trend_line(self, year, age=None, ax=None, legend=True, auto_label=True, 
+                        return_data=False, return_vals=False, **kwargs):
         if age:
             if isinstance(age, str):
                 age_slice = convert_age_to_slice(age)
 
             expected = self.expected_deaths.loc[year, age_slice].sum()
-            act = (self.rate_grouped.loc[:, age_slice] * self.age_grouped.loc[year, age_slice]).sum(axis=1)
-            exp = (self.rate_pred.loc[:, age_slice] * self.age_grouped.loc[year, age_slice]).sum(axis=1)
             excess = self.excess_deaths_daily.loc['2021', age].sum()
+            actual_all = (self.rate_grouped.loc[:, age_slice] * self.age_grouped.loc[year, age_slice]).sum(axis=1)
+            expected_all = (self.rate_pred.loc[:, age_slice] * self.age_grouped.loc[year, age_slice]).sum(axis=1)
         else:
             excess = self.excess.values[-1]
             expected = self.expected_deaths.sum(axis=1).loc[year]
-            act = (self.rate_grouped * self.age_grouped.loc[year]).sum(axis=1)
-            exp = (self.rate_pred * self.age_grouped.loc[year]).sum(axis=1)
-        
+            actual_all = (self.rate_grouped * self.age_grouped.loc[year]).sum(axis=1)
+            expected_all = (self.rate_pred * self.age_grouped.loc[year]).sum(axis=1)
         pred_year = expected + excess
+
         if ax is None:
             fig, ax = plt.subplots(**kwargs)
         else:
@@ -616,17 +678,15 @@ class Excess:
 
         if auto_label:
             ax.set_ylabel(
-                f"Deaths Standardized\nto Age-Stratified\n{year} Population",
-                rotation=0,
-                labelpad=35,
-                size=7,
+                f"Standardized Deaths",
+                size=11,
             )
-            ax.set_title(f"{self.country} {year} Expected Deaths vs Current Pace", size=10)
+            ax.set_title(f"{self.country} {age} Expected Deaths vs Current Pace - {year}", size=12)
 
-        ax.scatter(act.index, act.values, s=10)
-        model = ax.plot(exp.index, exp.values, label="Model")
+        ax.scatter(actual_all.index, actual_all.values, s=10)
+        model = ax.plot(expected_all.index, expected_all.values, label="Model")
         if year == 2021:
-            exp_year = exp.values[-1]
+            exp_year = expected_all.values[-1]
             point_pace = ax.scatter([2021], [pred_year], label="Current Pace", zorder=4)
             point_expected = ax.scatter([2021], [exp_year], label="Expected")
 
@@ -636,6 +696,19 @@ class Excess:
         ax.yaxis.set_major_formatter(StrMethodFormatter('{x:,.0f}'))
         if return_data:
             return model[0], point_pace, point_expected
+        if return_vals:
+            return actual_all, expected_all
+
+    def plot_single_cumulative_excess(self, age, start, end, **kwargs):
+        s = self.excess_deaths_daily.loc[start:end, age].cumsum()
+        fig, ax = plt.subplots(**kwargs)
+        s.plot(ax=ax)
+        phrase = 'Cumulative Excess Deaths'
+        if age != 'total':
+            phrase = age + ' ' + phrase
+            
+
+        ax.set_title(f'{self.country} {phrase}', size=10)
 
     def plot_rate(self, age, freq="W"):
         if age.endswith("+"):
