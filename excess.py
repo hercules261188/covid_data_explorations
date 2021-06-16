@@ -10,7 +10,7 @@ from matplotlib.dates import DateFormatter
 from matplotlib.ticker import StrMethodFormatter, MultipleLocator
 from sklearn.preprocessing import PowerTransformer
 from sklearn.compose import TransformedTargetRegressor
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import Ridge, RidgeCV
 from IPython.display import display
 
 
@@ -319,33 +319,6 @@ country_dict = {
 }
 
 
-def predict_deaths(s, last_training_year):
-    s_train = s.loc[:last_training_year]
-
-    n = len(s) + 1 # predict one year into the future
-    y = s_train.values
-    x = np.arange(n)
-    X = x.reshape(-1, 1)
-    X2 = np.column_stack((x, x ** 2))
-
-    n_train = len(s_train)
-    X_train = X[:n_train]
-    X2_train = X2[:n_train]
-
-    # train model using ridge regression on box-cox transformed values
-    ttr = TransformedTargetRegressor(regressor=Ridge(alpha=1), transformer=PowerTransformer('box-cox'))
-    ttr.fit(X_train, y)
-    yp1 = ttr.predict(X)
-    ttr.fit(X2_train, y)
-    yp2 = ttr.predict(X2)
-
-    # average predictions
-    yp = yp1 * 3/3 + yp2 * 0/3
-
-    index = range(s.index[0], s.index[-1] + 2)
-    sp = pd.Series(yp, index=index)
-    return sp
-
 def convert_age_to_slice(age):
     if age.endswith("+"):
         age = int(age[:-1])
@@ -385,7 +358,7 @@ def plot_excess_bars(title, countries, year='2019', age='total'):
     ax.set_title(title, size=10)
 
 
-def plot_cumulative_excess(start, end, countries, age='total', ax=None):
+def plot_cumulative_excess(start, end, countries, age='total', ax=None, **kwargs):
     start, end = str(start), str(end)
     names = []
     vals = []
@@ -397,7 +370,7 @@ def plot_cumulative_excess(start, end, countries, age='total', ax=None):
     df = pd.concat(vals, axis=1, keys=names).cumsum()
 
     if ax is None:
-        fig, ax = plt.subplots()
+        fig, ax = plt.subplots(**kwargs)
     df.plot(legend=False, ax=ax)
     add_line_name(names, ax)
     ax.axhline(color="black", ls="--")
@@ -405,12 +378,12 @@ def plot_cumulative_excess(start, end, countries, age='total', ax=None):
     year_string = f"{end}" if start == end else f"{start}-{end}"
     ax.set_title(f"{year_string} Cumulative Excess Deaths", size=10)
     ax.text(
-        0.99,
+        0.1,
         0.02,
         "Created by Teddy Petrou (@TedPetrou)",
         color="black",
         size=8,
-        ha="right",
+        ha="left",
         transform=ax.transAxes,
         style="italic",
     )
@@ -521,7 +494,7 @@ def plot_perc_mort_change(countries, age=70, year=2019, **kwargs):
 
 
 class Excess:
-    def __init__(self, country, start_year, last_training_year, skip, group_daily=False):
+    def __init__(self, country, start_year, last_training_year, pred_year, skip, group_daily=False):
         cur_dict = country_dict[country]
         self.country = country
         self.max_age = cur_dict["max_age"]
@@ -529,7 +502,7 @@ class Excess:
         self.skip = skip
         self.get_country_func = cur_dict["func"]
         self.last_training_year = last_training_year
-        self.first_pred_year = last_training_year + 1
+        self.pred_year = pred_year
         self.group_daily = group_daily
 
         self.get_historical_data()
@@ -560,14 +533,15 @@ class Excess:
 
     def get_age_deaths_rate(self):
         other_ages = list(range(45, 100, 5)) + [130]
-        bins = [0, 5, 10, 15, 25, 30, 35, 40] + other_ages
+        bins = [0, 5, 10, 15, 30, 40] + other_ages
+        # bins = [0, 15, 30, 40, 50, 60, 65, 70, 80, 90, 95, 130]
         self.age_grouper = pd.cut(self.age.columns, bins, right=False, precision=0)
 
         deaths_grouped = self.deaths.groupby(self.age_grouper, axis=1).sum()
         age_grouped = self.age.groupby(self.age_grouper, axis=1).sum()
         rate_grouped = (deaths_grouped / age_grouped).dropna()
 
-        rate_pred = rate_grouped.apply(predict_deaths, last_training_year=self.last_training_year)
+        rate_pred = rate_grouped.apply(self.predict_deaths)
         expected_deaths = rate_pred * age_grouped
 
         self.deaths_grouped = deaths_grouped
@@ -589,6 +563,38 @@ class Excess:
             .groupby(lambda x: x.month_name(), sort=False)
             .sum()
         )
+
+    def predict_deaths(self, s):
+        s_train = s.loc[:self.last_training_year]
+        num_predict = self.pred_year - self.last_training_year
+        n_train = len(s_train)
+        n = n_train + num_predict # predict into the future
+        y = s_train.values
+        x = np.arange(n)
+        X = x.reshape(-1, 1)
+        X2 = np.column_stack((x, x ** 2, x ** 3))
+        
+        X_train = X[:n_train]
+        X2_train = X2[:n_train]
+
+        # train model using ridge regression on box-cox transformed values
+        ttr = TransformedTargetRegressor(regressor=Ridge(alpha=10), 
+                                         transformer=PowerTransformer('box-cox'))
+        ttr.fit(X_train, y)
+        yp1 = ttr.predict(X)
+
+        if s.name.left < 90:
+            ttr.fit(X2_train, y)
+            yp2 = ttr.predict(X2)
+            
+            # average predictions
+            yp = yp1 * .9 + yp2 * .1
+        else:
+            yp = yp1
+
+        index = range(s.index[0], self.pred_year + 1)
+        sp = pd.Series(yp, index=index)
+        return sp
 
     def compute_month_mult(self):
         deaths = self.daily_deaths.loc[:f"{self.last_training_year}"]
@@ -669,7 +675,7 @@ class Excess:
             expected = self.expected_deaths.sum(axis=1).loc[year]
             actual_all = (self.rate_grouped * self.age_grouped.loc[year]).sum(axis=1)
             expected_all = (self.rate_pred * self.age_grouped.loc[year]).sum(axis=1)
-        pred_year = expected + excess
+        current_pace = expected + excess
 
         if ax is None:
             fig, ax = plt.subplots(**kwargs)
@@ -687,7 +693,7 @@ class Excess:
         model = ax.plot(expected_all.index, expected_all.values, label="Model")
         if year == 2021:
             exp_year = expected_all.values[-1]
-            point_pace = ax.scatter([2021], [pred_year], label="Current Pace", zorder=4)
+            point_pace = ax.scatter([2021], [current_pace], label="Current Pace", zorder=4)
             point_expected = ax.scatter([2021], [exp_year], label="Expected")
 
         if legend:
@@ -746,3 +752,16 @@ class Excess:
         )
         ax.axhline(rate_2021, ls="--", label="2021 overall weekly deaths per 1000")
         ax.legend()
+
+    def plot_excess_and_trend(self, age, start=2018, end=2021, figsize=(10, 7)):
+        fig = plt.Figure(figsize=figsize, tight_layout=True)
+        ax1 = fig.add_subplot(2, 1, 1)
+        ax2 = fig.add_subplot(2, 1, 2)
+
+        self.plot_month_exp_vs_actual(age, start, ax=ax1, figsize=(10, 4))
+        self.plot_trend_line(end, age, ax=ax2)
+        ax1.set_xlabel(None)
+        ax2.set_xticks(range(self.start_year, 2022, 2))
+        ax2.text(0.05, -.12, 'Deaths Standardized to 2021 Age-Stratified Population', 
+                transform=ax2.transAxes, style='italic')
+        return fig
